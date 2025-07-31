@@ -13,6 +13,9 @@ except ImportError:
     from scipy.ndimage import affine_transform as aff_trf
     gpu = False
 
+#TODO incorporate scaling with Z ratio before rotation
+#TODO get seconds between frames from binary timestamp using Alfredd's code: https://github.com/amsikking/pco_decode_timestamp
+
 class SnoutyFolder:
     """
     A class for processing and converting Snouty microscopy data folders to OME-TIFF format.

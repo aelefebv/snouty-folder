@@ -14,9 +14,6 @@ except ImportError:
     cp = None
     gpu = False
 
-#TODO incorporate scaling with Z ratio before rotation
-#TODO get seconds between frames from binary timestamp using Alfred's code: https://github.com/amsikking/pco_decode_timestamp
-
 class SnoutyFolder:
     """
     A class for processing and converting Snouty microscopy data folders to OME-TIFF format.
@@ -90,6 +87,7 @@ class SnoutyFolder:
         
         self.im_original_dims = self._load_original_dims()
         self.im_desheared_dims = self._load_desheared_dims()
+        self.final_rotation_angle = 0.0
         self.im_traditional_dims = self._load_traditional_dims()
         
         self.im_original_path: str | None = None
@@ -459,13 +457,15 @@ class SnoutyFolder:
               data clipping during rotation
         """
         scan_step_size_px = self.metadata["scan_step_size_px"]
-        rotation_angle = np.arctan(scan_step_size_px)
+        voxel_aspect_ratio = self.metadata["voxel_aspect_ratio"]
+        final_rotation_angle = np.arctan(scan_step_size_px/voxel_aspect_ratio)
+        initial_rotation_angle = np.arctan(scan_step_size_px)
         z_original = self.im_original_dims[2]
         y_original = self.im_original_dims[3]
-        y_rotated = int(np.rint(np.sin(rotation_angle) * y_original))
+        y_rotated = int(np.rint(np.sin(initial_rotation_angle) * y_original))
         z_rotated = int(np.rint(
-            z_original / np.cos(rotation_angle) + 
-            np.cos(rotation_angle) * (y_original)
+            (z_original*voxel_aspect_ratio / (np.cos(final_rotation_angle))) + 
+            (np.cos(initial_rotation_angle) * y_original/voxel_aspect_ratio)
         ))
         im_rotated_shape = (
             self.im_original_dims[0],  # T
@@ -582,8 +582,10 @@ class SnoutyFolder:
         Deskew a sheared (TxCxZxYxX) stack (src), rotate it into
         "traditional" orthogonal zyx view, and write the result to dst.
         """
-        M   = _affine_matrix(self.metadata["scan_step_size_px"])        # 3×3
+        zoom = self.metadata["voxel_aspect_ratio"]
         scan_step_size_px = self.metadata["scan_step_size_px"]
+        rotation_angle = scan_step_size_px/zoom
+        M   = np.linalg.inv(_affine_matrix(rotation_angle=rotation_angle, z_zoom=zoom))
         T, C, Z, Y, X = self.im_original_dims
         Tt, Ct, Zt, Yt, Xt = self.im_traditional_dims
         offset = np.zeros(3, dtype=np.float64)
@@ -609,7 +611,7 @@ class SnoutyFolder:
                     desheared_vol,
                     matrix=M,
                     offset=offset,  # type: ignore
-                    order=1,
+                    order=0,
                     prefilter=False,
                     output_shape=(Yt, Zt, Xt),       # crop happens here
                 )
@@ -627,22 +629,27 @@ class SnoutyFolder:
                     vol_out = np.flip(vol_out, axis=0)
                     dst[t, c] = vol_out
     
-def _affine_matrix(scan_step_px, clockwise: bool = True) -> np.ndarray:
-    """Return the 3x3 (z,y,x) rotation matrix for +/- atan(scan_step_px)
-    about the x-axis (clockwise by default)."""
-    theta = np.arctan(scan_step_px)
-    if clockwise:        # negative == clockwise in a right‑handed system
-        theta = -theta
+def _affine_matrix(rotation_angle, z_zoom: float) -> np.ndarray:
+    """Return the 3x3 (z,y,x) rotation matrix for +/- atan(rotation_angle)
+    about the x-axis with z scaling applied before rotation."""
+    # theta = np.pi/2 - np.arctan(rotation_angle)
+    theta = np.arctan(rotation_angle)
         
     c, s = np.cos(theta), np.sin(theta)
 
-    # axes are (z, y, x) ↔ rows 0,1,2
-    # z_in =  c*z_out + s*y_out
-    # y_in = -s*z_out + c*y_out
-    # x_in =  x_out
-    return np.array([[ c,  s, 0],
-                     [-s,  c, 0],
-                     [ 0,  0, 1]], dtype=np.float64)
+    # # Scaling matrix for z
+    scale_matrix = np.array([[z_zoom, 0, 0],
+                            [ 0, 1, 0],
+                            [ 0, 0, 1]], dtype=np.float64)
+    
+    # Rotation matrix about x-axis
+    rotation_matrix = np.array([[ c,  s, 0],
+                               [ -s,  c, 0],
+                               [  0,  0, 1]], dtype=np.float64)
+    
+    # return scale_matrix @ rotation_matrix
+    return rotation_matrix @ scale_matrix
+    # return rotation_matrix
 
 def decode_timestamp(image):
     """

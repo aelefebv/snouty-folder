@@ -11,10 +11,8 @@ try:
     gpu = True
 except ImportError:
     from scipy.ndimage import affine_transform as aff_trf
+    cp = None
     gpu = False
-
-#TODO incorporate scaling with Z ratio before rotation
-#TODO get seconds between frames from binary timestamp using Alfredd's code: https://github.com/amsikking/pco_decode_timestamp
 
 class SnoutyFolder:
     """
@@ -89,6 +87,7 @@ class SnoutyFolder:
         
         self.im_original_dims = self._load_original_dims()
         self.im_desheared_dims = self._load_desheared_dims()
+        self.final_rotation_angle = 0.0
         self.im_traditional_dims = self._load_traditional_dims()
         
         self.im_original_path: str | None = None
@@ -458,13 +457,15 @@ class SnoutyFolder:
               data clipping during rotation
         """
         scan_step_size_px = self.metadata["scan_step_size_px"]
-        rotation_angle = np.arctan(scan_step_size_px)
+        voxel_aspect_ratio = self.metadata["voxel_aspect_ratio"]
+        final_rotation_angle = np.arctan(scan_step_size_px/voxel_aspect_ratio)
+        initial_rotation_angle = np.arctan(scan_step_size_px)
         z_original = self.im_original_dims[2]
         y_original = self.im_original_dims[3]
-        y_rotated = int(np.rint(np.sin(rotation_angle) * y_original))
+        y_rotated = int(np.rint(np.sin(initial_rotation_angle) * y_original))
         z_rotated = int(np.rint(
-            z_original / np.cos(rotation_angle) + 
-            np.cos(rotation_angle) * (y_original)
+            (z_original*voxel_aspect_ratio / (np.cos(final_rotation_angle))) + 
+            (np.cos(initial_rotation_angle) * y_original/voxel_aspect_ratio)
         ))
         im_rotated_shape = (
             self.im_original_dims[0],  # T
@@ -486,16 +487,23 @@ class SnoutyFolder:
                 - PhysicalSizeZ: Z-axis pixel size in micrometers
                 - TimeIncrement: Time between frames in seconds
         """
-        vol_per_s = self.metadata["volumes_per_s"]
-        t_res_s = 1/vol_per_s if vol_per_s > 0 else 0.0
+        if len(self.data_files) > 1:
+            v1 = tifffile.memmap(self.data_files[0])[0, 0, :1, :14]
+            v2 = tifffile.memmap(self.data_files[1])[0, 0, :1, :14]
+            ts1 = decode_timestamp(v1)
+            ts2 = decode_timestamp(v2)
+            time_res = (ts2['time_us'] - ts1['time_us']) * 1e-6
+        else:
+            time_res = 0.0
+            
         xy_res_um = self.metadata["sample_px_um"]
         z_ratio = self.metadata["voxel_aspect_ratio"]
-        z__res_um = xy_res_um * z_ratio
+        z_res_um = xy_res_um * z_ratio
         return {
             'PhysicalSizeX': xy_res_um,
             'PhysicalSizeY': xy_res_um,
-            'PhysicalSizeZ': z__res_um,
-            'TimeIncrement': t_res_s,
+            'PhysicalSizeZ': z_res_um,
+            'TimeIncrement': time_res,
         }
     
     def _get_channel_ome(self):
@@ -574,12 +582,14 @@ class SnoutyFolder:
         Deskew a sheared (TxCxZxYxX) stack (src), rotate it into
         "traditional" orthogonal zyx view, and write the result to dst.
         """
-        M   = _affine_matrix(self.metadata["scan_step_size_px"])        # 3×3
+        zoom = self.metadata["voxel_aspect_ratio"]
         scan_step_size_px = self.metadata["scan_step_size_px"]
+        rotation_angle = scan_step_size_px/zoom
+        M   = np.linalg.inv(_affine_matrix(rotation_angle=rotation_angle, z_zoom=zoom))
         T, C, Z, Y, X = self.im_original_dims
         Tt, Ct, Zt, Yt, Xt = self.im_traditional_dims
         offset = np.zeros(3, dtype=np.float64)
-        if gpu:
+        if gpu and cp is not None:
             M = cp.asarray(M)
             offset = cp.asarray(offset)
             desheared_vol = cp.zeros((Z, Y + self.max_deshear_shift, X), dtype=cp.uint16)
@@ -591,7 +601,7 @@ class SnoutyFolder:
                 for z in range(Z):
                     deshear_shift = int(np.rint(scan_step_size_px * z))
                     y_slice = slice(deshear_shift, deshear_shift + Y)
-                    if gpu:
+                    if gpu and cp is not None:
                         desheared_vol[z, y_slice, :] = cp.asarray(src[t, c, z, :, :])
                     else:
                         desheared_vol[z, y_slice, :] = src[t, c, z, :, :]
@@ -600,50 +610,84 @@ class SnoutyFolder:
                 vol_out = aff_trf(
                     desheared_vol,
                     matrix=M,
-                    offset=offset,
-                    order=1,
+                    offset=offset,  # type: ignore
+                    order=0,
                     prefilter=False,
                     output_shape=(Yt, Zt, Xt),       # crop happens here
                 )
 
                 # 3. swap axes to get traditional view
-                if gpu:
-                    vol_out = cp.swapaxes(vol_out, 0, 1)
+                if gpu and cp is not None:
+                    vol_out = cp.swapaxes(vol_out, 0, 1) 
                     # Flip the Z so bottom is on bottom
-                    vol_out = cp.flip(vol_out, axis=0)
+                    vol_out = cp.flip(vol_out, axis=0) 
                     # Convert back to numpy for writing to dst
-                    dst[t, c] = cp.asnumpy(vol_out)
+                    dst[t, c] = cp.asnumpy(vol_out) 
                 else:
                     vol_out = np.swapaxes(vol_out, 0, 1)
                     # Flip the Z so bottom is on bottom
                     vol_out = np.flip(vol_out, axis=0)
                     dst[t, c] = vol_out
     
-def _affine_matrix(scan_step_px, clockwise: bool = True) -> np.ndarray:
-    """Return the 3x3 (z,y,x) rotation matrix for +/- atan(scan_step_px)
-    about the x-axis (clockwise by default)."""
-    theta = np.arctan(scan_step_px)
-    if clockwise:        # negative == clockwise in a right‑handed system
-        theta = -theta
+def _affine_matrix(rotation_angle, z_zoom: float) -> np.ndarray:
+    """Return the 3x3 (z,y,x) rotation matrix for +/- atan(rotation_angle)
+    about the x-axis with z scaling applied before rotation."""
+    # theta = np.pi/2 - np.arctan(rotation_angle)
+    theta = np.arctan(rotation_angle)
         
     c, s = np.cos(theta), np.sin(theta)
 
-    # axes are (z, y, x) ↔ rows 0,1,2
-    # z_in =  c*z_out + s*y_out
-    # y_in = -s*z_out + c*y_out
-    # x_in =  x_out
-    return np.array([[ c,  s, 0],
-                     [-s,  c, 0],
-                     [ 0,  0, 1]], dtype=np.float64)
+    # # Scaling matrix for z
+    scale_matrix = np.array([[z_zoom, 0, 0],
+                            [ 0, 1, 0],
+                            [ 0, 0, 1]], dtype=np.float64)
+    
+    # Rotation matrix about x-axis
+    rotation_matrix = np.array([[ c,  s, 0],
+                               [ -s,  c, 0],
+                               [  0,  0, 1]], dtype=np.float64)
+    
+    # return scale_matrix @ rotation_matrix
+    return rotation_matrix @ scale_matrix
+    # return rotation_matrix
 
-
-
+def decode_timestamp(image):
+    """
+    From Alfred:
+    https://github.com/amsikking/pco_decode_timestamp/blob/main/pco_decode_timestamp.py
+    
+    Decode PCO image timestamps from binary-coded decimal (see p94 of
+    "pco_camera_control_commands_105.pdf"). In this version of 'packed BCD' each
+    pixel contains 2 digits of information in a single byte (8bits). The lower
+    and upper nibbles (2 x 4bits) encode the numbers 0-9 which are then combined
+    to give a value in the range 0-99.
+    """
+    assert len(image.shape) == 2 and image.dtype == 'uint16'
+    bcd_px = image[0, :14]                      # get BCD pixels
+    lower_nibbles =  bcd_px & 0b00001111        # get lower nibbles
+    upper_nibbles = (bcd_px & 0b11110000) >> 4  # get upper nibbles and shift
+    dec_px = 10 * upper_nibbles + lower_nibbles # convert to decimal
+    timestamp = {}
+    timestamp['#'] = np.sum(
+        dec_px[:4] * np.array((1e6, 1e4, 1e2, 1)), dtype='uint32')
+    timestamp['DD'] = dec_px[7].astype('uint32')
+    timestamp['MM'] = dec_px[6].astype('uint32')    
+    timestamp['YYYY'] = np.sum(
+        dec_px[4:6] * np.array((1e2, 1)), dtype='uint32')
+    timestamp['h'] = dec_px[8].astype('uint32')
+    timestamp['min'] = dec_px[9].astype('uint32')
+    timestamp['s'] = dec_px[10].astype('uint32')
+    timestamp['us'] = np.sum(
+        dec_px[11:14] * np.array((1e4, 1e2, 1), dtype='uint64'))
+    timestamp['time_us'] = np.sum(              # total us on a given day
+        dec_px[8:14] * np.array((36e8, 60e6, 1e6, 1e4, 1e2, 1)), dtype='uint64')
+    return timestamp
 
 
 if __name__ == "__main__":
     folders = [
         r"D:\test_files\test_snouty\2025-07-11_15-08-54_000_A1A2B1B2_acquire",
-        r"D:\test_files\test_snouty\2025-07-11_17-43-38_000_ht_sols_acquire",
+        # r"D:\test_files\test_snouty\2025-07-11_17-43-38_000_ht_sols_acquire",
     ]
     # Example usage
     for folder in folders:

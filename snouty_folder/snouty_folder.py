@@ -488,8 +488,8 @@ class SnoutyFolder:
                 - TimeIncrement: Time between frames in seconds
         """
         if len(self.data_files) > 1:
-            v1 = tifffile.memmap(self.data_files[0])[0, 0, :1, :14]
-            v2 = tifffile.memmap(self.data_files[1])[0, 0, :1, :14]
+            v1 = tifffile.memmap(self.data_files[0], mode='r')[0, 0, :1, :14]
+            v2 = tifffile.memmap(self.data_files[1], mode='r')[0, 0, :1, :14]
             ts1 = decode_timestamp(v1)
             ts2 = decode_timestamp(v2)
             time_res = (ts2['time_us'] - ts1['time_us']) * 1e-6
@@ -686,11 +686,12 @@ def decode_timestamp(image):
 
 if __name__ == "__main__":
     folders = [
-        r"D:\test_files\test_snouty\2025-07-11_15-08-54_000_A1A2B1B2_acquire",
+        r"\\zfsdata06\HT-SOLS_v1.0-ro\Dave_Harris\2025-08-20_13-05-13_ht_sols_gui_session\2025-08-20_14-00-47_000_ht_sols_tile",
         # r"D:\test_files\test_snouty\2025-07-11_17-43-38_000_ht_sols_acquire",
     ]
+    out_dir = r"Z:\snouty_out\david_cilia"
     # Example usage
     for folder in folders:
-        snouty_folder = SnoutyFolder(folder)
+        snouty_folder = SnoutyFolder(folder, out_dir=out_dir)
         output_path = snouty_folder.write_traditional_ome_tif()
         print("OME-TIFF file written successfully.")

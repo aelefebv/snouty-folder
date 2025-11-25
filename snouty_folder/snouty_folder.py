@@ -69,6 +69,7 @@ class SnoutyFolder:
         self.dir_path = dir_path
         self.dir_name = Path(self.dir_path).name
         self.out_dir = out_dir or self.dir_path
+        os.makedirs(self.out_dir, exist_ok=True)
         
         self._remove_timestamp = remove_timestamp
         self._num_timestamp_px = 8 if self._remove_timestamp else 0
@@ -128,9 +129,13 @@ class SnoutyFolder:
             # Load the data file as a numpy array
             data = tifffile.imread(data_file)[..., self._num_timestamp_px:, :]
             # Swap first two dimensions to match OME-TIFF order (TCZYX)
-            data = np.swapaxes(data, 0, 1)  # Assuming data is in (Z, C, Y, X) order
+            if len(self.channels) > 1:
+                data = np.swapaxes(data, 0, 1)  # Assuming data is in (Z, C, Y, X) order
             # Write the data to the OME-TIFF file
-            ome_memmap[i, :, :, :, :] = data
+            if len(self.data_files) > 1:
+                ome_memmap[i, ...] = data
+            else:
+                ome_memmap[...] = data
         ome_memmap.flush()
         return self.im_original_path
     
@@ -488,8 +493,19 @@ class SnoutyFolder:
                 - TimeIncrement: Time between frames in seconds
         """
         if len(self.data_files) > 1:
-            v1 = tifffile.memmap(self.data_files[0], mode='r')[0, 0, :1, :14]
-            v2 = tifffile.memmap(self.data_files[1], mode='r')[0, 0, :1, :14]
+            # Determine the slice for the channel dimension based on the number of channels
+            channel_slice = 0 if len(self.channels) > 1 else None
+            
+            # Construct the full slice tuple, omitting the channel slice if only one channel
+            slice_v1 = (0, channel_slice, slice(None, 1), slice(None, 14))
+            slice_v2 = (0, channel_slice, slice(None, 1), slice(None, 14))
+
+            # Filter out None from the slice tuple
+            slice_v1 = tuple(s for s in slice_v1 if s is not None)
+            slice_v2 = tuple(s for s in slice_v2 if s is not None)
+
+            v1 = tifffile.memmap(self.data_files[0], mode='r')[slice_v1]
+            v2 = tifffile.memmap(self.data_files[1], mode='r')[slice_v2]
             ts1 = decode_timestamp(v1)
             ts2 = decode_timestamp(v2)
             time_res = (ts2['time_us'] - ts1['time_us']) * 1e-6
@@ -589,22 +605,40 @@ class SnoutyFolder:
         T, C, Z, Y, X = self.im_original_dims
         Tt, Ct, Zt, Yt, Xt = self.im_traditional_dims
         offset = np.zeros(3, dtype=np.float64)
+        
+        # Determine if src has an explicit channel dimension (C > 1)
+        src_has_channel_dim = C > 1
+        
         if gpu and cp is not None:
             M = cp.asarray(M)
             offset = cp.asarray(offset)
             desheared_vol = cp.zeros((Z, Y + self.max_deshear_shift, X), dtype=cp.uint16)
         else:
             desheared_vol = np.zeros((Z, Y + self.max_deshear_shift, X), dtype=np.uint16)
-        for t in range(T):
-            for c in range(C):
-                print(f"Processing {t=}/{T}, {c=}/{C}")
-                for z in range(Z):
-                    deshear_shift = int(np.rint(scan_step_size_px * z))
+        
+        for t_idx in range(T):
+            for c_idx in range(C):
+                print(f"Processing {t_idx=}/{T}, {c_idx=}/{C}")
+                for z_idx in range(Z):
+                    deshear_shift = int(np.rint(scan_step_size_px * z_idx))
                     y_slice = slice(deshear_shift, deshear_shift + Y)
+                    
+                    # Extract the current slice from src, handling T and C dimensions
+                    if T > 1: # If there's an explicit time dimension
+                        if src_has_channel_dim:
+                            current_slice = src[t_idx, c_idx, z_idx, :, :]
+                        else: # C == 1, src is (T, Z, Y, X)
+                            current_slice = src[t_idx, z_idx, :, :]
+                    else: # T == 1, src is (C, Z, Y, X) or (Z, Y, X)
+                        if src_has_channel_dim:
+                            current_slice = src[c_idx, z_idx, :, :]
+                        else: # T == 1 and C == 1, src is (Z, Y, X)
+                            current_slice = src[z_idx, :, :]
+
                     if gpu and cp is not None:
-                        desheared_vol[z, y_slice, :] = cp.asarray(src[t, c, z, :, :])
+                        desheared_vol[z_idx, y_slice, :] = cp.asarray(current_slice)
                     else:
-                        desheared_vol[z, y_slice, :] = src[t, c, z, :, :]
+                        desheared_vol[z_idx, y_slice, :] = current_slice
                 
                 # 2. rotate around x‑axis
                 vol_out = aff_trf(
@@ -618,16 +652,34 @@ class SnoutyFolder:
 
                 # 3. swap axes to get traditional view
                 if gpu and cp is not None:
-                    vol_out = cp.swapaxes(vol_out, 0, 1) 
+                    vol_out = cp.swapaxes(vol_out, 0, 1)
                     # Flip the Z so bottom is on bottom
-                    vol_out = cp.flip(vol_out, axis=0) 
+                    vol_out = cp.flip(vol_out, axis=0)
                     # Convert back to numpy for writing to dst
-                    dst[t, c] = cp.asnumpy(vol_out) 
+                    if T > 1:
+                        if src_has_channel_dim:
+                            dst[t_idx, c_idx] = cp.asnumpy(vol_out)
+                        else:
+                            dst[t_idx] = cp.asnumpy(vol_out)
+                    else: # T == 1
+                        if src_has_channel_dim:
+                            dst[c_idx] = cp.asnumpy(vol_out)
+                        else:
+                            dst[:] = cp.asnumpy(vol_out) # Assign to the single volume
                 else:
                     vol_out = np.swapaxes(vol_out, 0, 1)
                     # Flip the Z so bottom is on bottom
                     vol_out = np.flip(vol_out, axis=0)
-                    dst[t, c] = vol_out
+                    if T > 1:
+                        if src_has_channel_dim:
+                            dst[t_idx, c_idx] = vol_out
+                        else:
+                            dst[t_idx] = vol_out
+                    else: # T == 1
+                        if src_has_channel_dim:
+                            dst[c_idx] = vol_out
+                        else:
+                            dst[:] = vol_out # Assign to the single volume
     
 def _affine_matrix(rotation_angle, z_zoom: float) -> np.ndarray:
     """Return the 3x3 (z,y,x) rotation matrix for +/- atan(rotation_angle)
@@ -686,10 +738,10 @@ def decode_timestamp(image):
 
 if __name__ == "__main__":
     folders = [
-        r"\\zfsdata06\HT-SOLS_v1.0-ro\Dave_Harris\2025-08-20_13-05-13_ht_sols_gui_session\2025-08-20_14-00-47_000_ht_sols_tile",
+        r"C:\test_files_C\john_calcium_single",
         # r"D:\test_files\test_snouty\2025-07-11_17-43-38_000_ht_sols_acquire",
     ]
-    out_dir = r"Z:\snouty_out\david_cilia"
+    out_dir = r"C:\test_files_C\john_calcium_single_out"
     # Example usage
     for folder in folders:
         snouty_folder = SnoutyFolder(folder, out_dir=out_dir)

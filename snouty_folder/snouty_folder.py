@@ -538,14 +538,21 @@ class SnoutyFolder:
         """
         channel_ome = []
         for ch_num, channel in enumerate(self.channels):
-            channel_ome.append(
-                model.Channel(
-                    id=f"Channel:{ch_num}",
-                    name=str(ch_num),
-                    emission_wavelength=channel,
-                    samples_per_pixel=1,
-                )
+            kwargs = dict(
+                id=f"Channel:{ch_num}",
+                name=str(channel),
+                samples_per_pixel=1,
             )
+            try:
+                kwargs["emission_wavelength"] = float(channel)
+                kwargs["illumination_type"] = model.Channel_IlluminationType.EPIFLUORESCENCE
+                kwargs["acquisition_mode"] = model.Channel_AcquisitionMode.SPIM
+                kwargs["contrast_method"] = model.Channel_ContrastMethod.FLUORESCENCE
+            except (TypeError, ValueError):
+                kwargs["illumination_type"] = model.Channel_IlluminationType.TRANSMITTED
+                kwargs["acquisition_mode"] = model.Channel_AcquisitionMode.BRIGHT_FIELD
+                kwargs["contrast_method"] = model.Channel_ContrastMethod.BRIGHTFIELD
+            channel_ome.append(model.Channel(**kwargs))
         return channel_ome
     
     def _get_max_deshear_shift(self):
